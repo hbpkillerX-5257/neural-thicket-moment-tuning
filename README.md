@@ -29,6 +29,13 @@ cd neural-thicket-moment-tuning
 pip install -q -r requirements.txt
 ```
 
+If LoRA training fails with a `torchao` version error, either pull the latest
+code (it skips incompatible torchao automatically) or run:
+
+```bash
+pip uninstall -y torchao
+```
+
 Restart the notebook kernel if Kaggle had already imported `transformers`
 before installation.
 

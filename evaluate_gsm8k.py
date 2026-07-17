@@ -353,6 +353,9 @@ def load_qwen_model(
     if lora_adapter is not None:
         from peft import PeftModel
 
+        from peft_compat import disable_incompatible_torchao
+
+        disable_incompatible_torchao()
         model = PeftModel.from_pretrained(model, lora_adapter)
         trainable = sum(
             parameter.numel()

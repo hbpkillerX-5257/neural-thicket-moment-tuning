@@ -200,6 +200,14 @@ def load_training_model(
     from peft import LoraConfig, PeftModel, get_peft_model
     from transformers import Qwen3_5ForConditionalGeneration
 
+    from peft_compat import disable_incompatible_torchao
+
+    if disable_incompatible_torchao():
+        print(
+            "Disabled incompatible torchao for PEFT LoRA; using nn.Linear adapters.",
+            flush=True,
+        )
+
     model = Qwen3_5ForConditionalGeneration.from_pretrained(
         args.model,
         torch_dtype=torch.float16,
