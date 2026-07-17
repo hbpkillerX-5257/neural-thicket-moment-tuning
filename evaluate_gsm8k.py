@@ -15,6 +15,7 @@ rerunning the same command without --overwrite.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -23,7 +24,6 @@ from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
-
 
 DEFAULT_MODEL = "Qwen/Qwen3.5-0.8B"
 DEFAULT_DATASET = "openai/gsm8k"
@@ -58,6 +58,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-input-tokens", type=int, default=512)
     parser.add_argument("--max-new-tokens", type=int, default=384)
     parser.add_argument(
+        "--moment-adapter",
+        type=Path,
+        default=None,
+        help="Optional directory containing adapter_config.json and adapter weights.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Delete existing predictions in output-dir instead of resuming.",
@@ -85,11 +91,7 @@ def canonical_number(value: str | None) -> Fraction | None:
         return None
 
     cleaned = (
-        value.strip()
-        .replace(",", "")
-        .replace("$", "")
-        .replace("%", "")
-        .rstrip(".")
+        value.strip().replace(",", "").replace("$", "").replace("%", "").rstrip(".")
     )
     try:
         if "/" in cleaned:
@@ -177,6 +179,34 @@ def append_records(path: Path, records: list[dict[str, Any]]) -> None:
         os.fsync(handle.fileno())
 
 
+def adapter_descriptor(adapter_dir: Path | None) -> dict[str, Any] | None:
+    if adapter_dir is None:
+        return None
+    from moment_tuning import ADAPTER_CONFIG_NAME, ADAPTER_WEIGHTS_NAME
+
+    config_path = adapter_dir / ADAPTER_CONFIG_NAME
+    weights_path = adapter_dir / ADAPTER_WEIGHTS_NAME
+    if not config_path.exists() or not weights_path.exists():
+        raise FileNotFoundError(
+            f"{adapter_dir} must contain {ADAPTER_CONFIG_NAME} and "
+            f"{ADAPTER_WEIGHTS_NAME}."
+        )
+    digest = hashlib.sha256()
+    for path in (config_path, weights_path):
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    return {
+        "path": str(adapter_dir),
+        "sha256": digest.hexdigest(),
+        "base_model": config.get("base_model"),
+        "mode": config.get("mode"),
+        "module_count": config.get("module_count"),
+        "trainable_parameter_count": config.get("trainable_parameter_count"),
+    }
+
+
 def make_run_config(args: argparse.Namespace, world_size: int) -> dict[str, Any]:
     return {
         "model": args.model,
@@ -191,6 +221,7 @@ def make_run_config(args: argparse.Namespace, world_size: int) -> dict[str, Any]
         "decoding": "greedy",
         "thinking": False,
         "system_prompt": DEFAULT_SYSTEM_PROMPT,
+        "moment_adapter": adapter_descriptor(args.moment_adapter),
     }
 
 
@@ -238,7 +269,12 @@ def prepare_output(
     return output_dir / f"predictions.rank{rank}.jsonl"
 
 
-def load_qwen_model(model_id: str, device: Any, trust_remote_code: bool) -> tuple[Any, Any]:
+def load_qwen_model(
+    model_id: str,
+    device: Any,
+    trust_remote_code: bool,
+    moment_adapter: Path | None = None,
+) -> tuple[Any, Any]:
     """Load Qwen3.5's multimodal wrapper for text-only generation."""
     import torch
     from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
@@ -253,6 +289,19 @@ def load_qwen_model(model_id: str, device: Any, trust_remote_code: bool) -> tupl
         low_cpu_mem_usage=True,
         trust_remote_code=trust_remote_code,
     )
+    if moment_adapter is not None:
+        from moment_tuning import load_moment_adapter, moment_statistics
+
+        load_moment_adapter(
+            model,
+            moment_adapter,
+            expected_base_model=model_id,
+        )
+        print(
+            f"Loaded moment adapter {moment_adapter}: "
+            f"{json.dumps(moment_statistics(model))}",
+            flush=True,
+        )
     model.to(device)
     model.eval()
 
@@ -313,6 +362,7 @@ def evaluate_worker(args: argparse.Namespace) -> None:
             args.model,
             device,
             args.trust_remote_code,
+            args.moment_adapter,
         )
         started = time.monotonic()
 
