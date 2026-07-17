@@ -61,7 +61,13 @@ def parse_args() -> argparse.Namespace:
         "--moment-adapter",
         type=Path,
         default=None,
-        help="Optional directory containing adapter_config.json and adapter weights.",
+        help="Optional directory containing moment adapter_config.json and weights.",
+    )
+    parser.add_argument(
+        "--lora-adapter",
+        type=Path,
+        default=None,
+        help="Optional PEFT LoRA adapter directory (adapter_config.json + weights).",
     )
     parser.add_argument(
         "--overwrite",
@@ -179,7 +185,16 @@ def append_records(path: Path, records: list[dict[str, Any]]) -> None:
         os.fsync(handle.fileno())
 
 
-def adapter_descriptor(adapter_dir: Path | None) -> dict[str, Any] | None:
+def _hash_paths(paths: list[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in paths:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def moment_adapter_descriptor(adapter_dir: Path | None) -> dict[str, Any] | None:
     if adapter_dir is None:
         return None
     from moment_tuning import ADAPTER_CONFIG_NAME, ADAPTER_WEIGHTS_NAME
@@ -191,15 +206,10 @@ def adapter_descriptor(adapter_dir: Path | None) -> dict[str, Any] | None:
             f"{adapter_dir} must contain {ADAPTER_CONFIG_NAME} and "
             f"{ADAPTER_WEIGHTS_NAME}."
         )
-    digest = hashlib.sha256()
-    for path in (config_path, weights_path):
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
     config = json.loads(config_path.read_text(encoding="utf-8"))
     return {
         "path": str(adapter_dir),
-        "sha256": digest.hexdigest(),
+        "sha256": _hash_paths([config_path, weights_path]),
         "base_model": config.get("base_model"),
         "mode": config.get("mode"),
         "module_count": config.get("module_count"),
@@ -207,7 +217,40 @@ def adapter_descriptor(adapter_dir: Path | None) -> dict[str, Any] | None:
     }
 
 
+def lora_adapter_descriptor(adapter_dir: Path | None) -> dict[str, Any] | None:
+    if adapter_dir is None:
+        return None
+    config_path = adapter_dir / "adapter_config.json"
+    weight_candidates = [
+        adapter_dir / "adapter_model.safetensors",
+        adapter_dir / "adapter_model.bin",
+    ]
+    weights_path = next((path for path in weight_candidates if path.exists()), None)
+    if not config_path.exists() or weights_path is None:
+        raise FileNotFoundError(
+            f"{adapter_dir} must contain adapter_config.json and "
+            "adapter_model.safetensors (or .bin)."
+        )
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    metadata_path = adapter_dir / "training_metadata.json"
+    metadata = (
+        json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata_path.exists()
+        else {}
+    )
+    return {
+        "path": str(adapter_dir),
+        "sha256": _hash_paths([config_path, weights_path]),
+        "peft_type": config.get("peft_type"),
+        "r": config.get("r"),
+        "lora_alpha": config.get("lora_alpha"),
+        "trainable_parameter_count": metadata.get("trainable_parameter_count"),
+    }
+
+
 def make_run_config(args: argparse.Namespace, world_size: int) -> dict[str, Any]:
+    if args.moment_adapter is not None and args.lora_adapter is not None:
+        raise ValueError("Pass only one of --moment-adapter or --lora-adapter.")
     return {
         "model": args.model,
         "dataset": args.dataset,
@@ -221,7 +264,8 @@ def make_run_config(args: argparse.Namespace, world_size: int) -> dict[str, Any]
         "decoding": "greedy",
         "thinking": False,
         "system_prompt": DEFAULT_SYSTEM_PROMPT,
-        "moment_adapter": adapter_descriptor(args.moment_adapter),
+        "moment_adapter": moment_adapter_descriptor(args.moment_adapter),
+        "lora_adapter": lora_adapter_descriptor(args.lora_adapter),
     }
 
 
@@ -274,10 +318,14 @@ def load_qwen_model(
     device: Any,
     trust_remote_code: bool,
     moment_adapter: Path | None = None,
+    lora_adapter: Path | None = None,
 ) -> tuple[Any, Any]:
     """Load Qwen3.5's multimodal wrapper for text-only generation."""
     import torch
     from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
+
+    if moment_adapter is not None and lora_adapter is not None:
+        raise ValueError("Pass only one of moment_adapter or lora_adapter.")
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_id,
@@ -300,6 +348,20 @@ def load_qwen_model(
         print(
             f"Loaded moment adapter {moment_adapter}: "
             f"{json.dumps(moment_statistics(model))}",
+            flush=True,
+        )
+    if lora_adapter is not None:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, lora_adapter)
+        trainable = sum(
+            parameter.numel()
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        )
+        print(
+            f"Loaded LoRA adapter {lora_adapter} "
+            f"(trainable_when_loaded={trainable})",
             flush=True,
         )
     model.to(device)
@@ -362,7 +424,8 @@ def evaluate_worker(args: argparse.Namespace) -> None:
             args.model,
             device,
             args.trust_remote_code,
-            args.moment_adapter,
+            moment_adapter=args.moment_adapter,
+            lora_adapter=args.lora_adapter,
         )
         started = time.monotonic()
 

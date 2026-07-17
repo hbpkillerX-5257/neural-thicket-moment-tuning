@@ -152,6 +152,50 @@ Training output includes:
 - `data_stats.json`: split sizes and truncation counts
 - `run_config.json`: exact experimental configuration
 
+## LoRA comparison (same 2xT4 setup)
+
+`train_gsm8k_lora.py` mirrors the moment trainer: same GSM8K split seed,
+validation size, sequence length, batching, epochs, DDP, and checkpointing.
+Only the adapter and default learning rate differ (`2e-4`, rank `1`).
+
+Smoke test:
+
+```bash
+pip install -q -r requirements.txt
+
+torchrun --standalone --nproc_per_node=2 train_gsm8k_lora.py \
+  --output-dir outputs/lora-smoke \
+  --train-samples 128 \
+  --validation-size 32 \
+  --epochs 2 \
+  --max-steps 20 \
+  --gradient-accumulation-steps 2 \
+  --save-every-steps 5 \
+  --overwrite
+```
+
+Full LoRA training:
+
+```bash
+torchrun --standalone --nproc_per_node=2 train_gsm8k_lora.py \
+  --output-dir outputs/lora-gsm8k \
+  --overwrite
+```
+
+If your moment run used a different batch size, pass the same values here so
+the effective batch size matches. Resume with `--resume` instead of
+`--overwrite`.
+
+Evaluate the validation-selected adapter:
+
+```bash
+torchrun --standalone --nproc_per_node=2 evaluate_gsm8k.py \
+  --batch-size 4 \
+  --lora-adapter outputs/lora-gsm8k/adapter-best \
+  --output-dir outputs/lora-gsm8k-test \
+  --overwrite
+```
+
 ## Tests
 
 The local tests verify answer parsing, initialization equivalence, efficient
