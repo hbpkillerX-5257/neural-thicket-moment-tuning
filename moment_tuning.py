@@ -13,8 +13,23 @@ from torch import nn
 ADAPTER_CONFIG_NAME = "adapter_config.json"
 ADAPTER_WEIGHTS_NAME = "adapter_model.safetensors"
 DEFAULT_TARGET_PREFIX = "model.language_model.layers."
+DEFAULT_TARGET_SCOPE = "mlp"
 FORMAT_VERSION = 1
 VALID_MODES = {"both", "mean", "scale"}
+VALID_TARGET_SCOPES = {"all", "mlp", "attention"}
+# Qwen-style language-layer linear suffixes.
+MLP_TARGET_SUFFIXES = ("gate_proj", "up_proj", "down_proj")
+ATTENTION_TARGET_SUFFIXES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "in_proj_qkv",
+    "in_proj_z",
+    "in_proj_b",
+    "in_proj_a",
+    "out_proj",
+)
 
 
 class _MomentAffine(torch.autograd.Function):
@@ -168,16 +183,35 @@ def _set_submodule(model: nn.Module, name: str, module: nn.Module) -> None:
     setattr(parent, child_name, module)
 
 
+def _matches_target_scope(name: str, target_scope: str) -> bool:
+    if target_scope == "all":
+        return True
+    if target_scope == "mlp":
+        return ".mlp." in name or name.endswith(MLP_TARGET_SUFFIXES)
+    if target_scope == "attention":
+        return name.endswith(ATTENTION_TARGET_SUFFIXES)
+    raise ValueError(
+        f"target_scope must be one of {sorted(VALID_TARGET_SCOPES)}, "
+        f"got {target_scope!r}."
+    )
+
+
 def inject_moment_adapters(
     model: nn.Module,
     *,
     mode: str = "both",
     target_prefix: str = DEFAULT_TARGET_PREFIX,
+    target_scope: str = DEFAULT_TARGET_SCOPE,
     module_names: list[str] | None = None,
 ) -> list[str]:
     """Freeze a model and replace selected language-layer linears in-place."""
     if mode not in VALID_MODES:
         raise ValueError(f"mode must be one of {sorted(VALID_MODES)}, got {mode!r}.")
+    if target_scope not in VALID_TARGET_SCOPES:
+        raise ValueError(
+            f"target_scope must be one of {sorted(VALID_TARGET_SCOPES)}, "
+            f"got {target_scope!r}."
+        )
 
     model.requires_grad_(False)
     allowed = set(module_names) if module_names is not None else None
@@ -187,6 +221,7 @@ def inject_moment_adapters(
         if isinstance(module, nn.Linear)
         and not isinstance(module, MomentLinear)
         and name.startswith(target_prefix)
+        and (allowed is not None or _matches_target_scope(name, target_scope))
         and (allowed is None or name in allowed)
     ]
 
@@ -200,7 +235,8 @@ def inject_moment_adapters(
             )
     if not targets:
         raise ValueError(
-            f"No nn.Linear modules found under target prefix {target_prefix!r}."
+            f"No nn.Linear modules found under target prefix {target_prefix!r} "
+            f"with target_scope={target_scope!r}."
         )
 
     for name, linear in targets:
@@ -269,10 +305,17 @@ def save_moment_adapter(
     base_model: str,
     mode: str,
     target_prefix: str = DEFAULT_TARGET_PREFIX,
+    target_scope: str = DEFAULT_TARGET_SCOPE,
     training_metadata: dict[str, Any] | None = None,
 ) -> Path:
     """Save adapter-only scalars and the information needed to restore them."""
     from safetensors.torch import save_file
+
+    if target_scope not in VALID_TARGET_SCOPES:
+        raise ValueError(
+            f"target_scope must be one of {sorted(VALID_TARGET_SCOPES)}, "
+            f"got {target_scope!r}."
+        )
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -289,6 +332,7 @@ def save_moment_adapter(
         "base_model": base_model,
         "mode": mode,
         "target_prefix": target_prefix,
+        "target_scope": target_scope,
         "module_names": module_names,
         "module_count": len(module_names),
         "trainable_parameter_count": count_moment_parameters(model),
@@ -334,6 +378,7 @@ def load_moment_adapter(
         model,
         mode=config["mode"],
         target_prefix=config["target_prefix"],
+        target_scope=config.get("target_scope", "all"),
         module_names=module_names,
     )
     state = load_file(adapter_path / ADAPTER_WEIGHTS_NAME, device="cpu")

@@ -25,6 +25,7 @@ from typing import Any
 from evaluate_gsm8k import DEFAULT_DATASET, DEFAULT_MODEL, DEFAULT_SYSTEM_PROMPT
 from moment_tuning import (
     DEFAULT_TARGET_PREFIX,
+    DEFAULT_TARGET_SCOPE,
     count_moment_parameters,
     inject_moment_adapters,
     load_moment_adapter,
@@ -41,6 +42,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-config", default="main")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/moment-gsm8k"))
     parser.add_argument("--mode", choices=["both", "mean", "scale"], default="both")
+    parser.add_argument(
+        "--target-scope",
+        choices=["all", "mlp", "attention"],
+        default=DEFAULT_TARGET_SCOPE,
+        help="Which language-layer linears get moment adapters. Default: mlp only.",
+    )
     parser.add_argument("--validation-size", type=int, default=500)
     parser.add_argument(
         "--train-samples",
@@ -120,6 +127,7 @@ def run_config(args: argparse.Namespace, world_size: int) -> dict[str, Any]:
         "dataset_config": args.dataset_config,
         "mode": args.mode,
         "target_prefix": DEFAULT_TARGET_PREFIX,
+        "target_scope": args.target_scope,
         "validation_size": args.validation_size,
         "train_samples": args.train_samples,
         "max_length": args.max_length,
@@ -350,7 +358,11 @@ def load_training_model(
         trust_remote_code=args.trust_remote_code,
     )
     if resume_dir is None:
-        names = inject_moment_adapters(model, mode=args.mode)
+        names = inject_moment_adapters(
+            model,
+            mode=args.mode,
+            target_scope=args.target_scope,
+        )
     else:
         adapter_config = load_moment_adapter(
             model,
@@ -360,6 +372,11 @@ def load_training_model(
         names = adapter_config["module_names"]
         if adapter_config["mode"] != args.mode:
             raise ValueError("Checkpoint adapter mode does not match --mode.")
+        checkpoint_scope = adapter_config.get("target_scope", "all")
+        if checkpoint_scope != args.target_scope:
+            raise ValueError(
+                "Checkpoint adapter target_scope does not match --target-scope."
+            )
 
     model.config.use_cache = False
     if not args.no_gradient_checkpointing:
@@ -406,6 +423,7 @@ def save_checkpoint(
         checkpoint_dir / "adapter",
         base_model=args.model,
         mode=args.mode,
+        target_scope=args.target_scope,
         training_metadata={
             "epoch": epoch,
             "next_batch": next_batch,
@@ -776,6 +794,7 @@ def train(args: argparse.Namespace) -> None:
                     args.output_dir / "adapter-best",
                     base_model=args.model,
                     mode=args.mode,
+                    target_scope=args.target_scope,
                     training_metadata={
                         "selected_epoch": epoch + 1,
                         "global_step": global_step,
@@ -793,6 +812,7 @@ def train(args: argparse.Namespace) -> None:
             args.output_dir / "adapter-final",
             base_model=args.model,
             mode=args.mode,
+            target_scope=args.target_scope,
             training_metadata={
                 "global_step": global_step,
                 "best_validation_loss": best_validation_loss,
